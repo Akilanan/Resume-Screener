@@ -1,9 +1,9 @@
-# TalentAI - Resume Screener & Talent Intelligence Platform
+# TalentAI — Resume Screener & Talent Intelligence Platform
 
 AI-powered bulk resume screening using LLM + event-driven async processing.
 
 ## Architecture
-Frontend (React) -> FastAPI Backend -> RabbitMQ Queue -> AI Workers (x2) -> PostgreSQL
+Frontend (React) → FastAPI Backend → RabbitMQ Queue → AI Workers (x2) → PostgreSQL
 
 ## Quick Start
 
@@ -38,36 +38,36 @@ if not db.query(User).filter(User.email == 'admin@talentai.com').first():
     )
     db.add(admin)
     db.commit()
-    print('[OK] Admin created successfully!')
+    print('✅ Admin created successfully!')
 else:
     print('Admin already exists.')
 "
 ```
 
 ### 4. Access the Platform
-- **Frontend App**: http://localhost:5173
-- **API Docs**: http://localhost:8000/docs
-- **RabbitMQ Dashboard**: http://localhost:15672 (guest / guest)
-- **Grafana**: http://localhost:3001
+- **Frontend App**: [http://localhost:5173](http://localhost:5173)
+- **API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **RabbitMQ Dashboard**: [http://localhost:15672](http://localhost:15672) (guest / guest)
+- **Grafana**: [http://localhost:3001](http://localhost:3001)
 
-### [KEY] Default Credentials
-- **Email**: admin@talentai.com
-- **Password**: Admin@123
+### 🔑 Default Credentials
+- **Email**: `admin@talentai.com`
+- **Password**: `Admin@123`
 - **MFA / OTP**: Check the backend console logs for the 6-digit code.
 
 ---
 
-- [OK] Modern High-Fidelity Dashboard using MUI & Radix UI
-- [OK] Smooth animations and transitions via Framer Motion
-- [OK] JWT Authentication with MFA (OTP via console/email)
-- [OK] Role-based access: Admin vs HR
-- [OK] Async resume processing via RabbitMQ
-- [OK] PII encryption for all candidate data in DB using Fernet
-- [OK] 2 parallel workers for high-throughput screening
-- [OK] Complete observability with Prometheus & Grafana
-- [OK] Docker Compose single-command deployment
+- ✅ Modern High-Fidelity Dashboard using **MUI** & **Radix UI**
+- ✅ Smooth animations and transitions via **Framer Motion**
+- ✅ JWT Authentication with MFA (OTP via console/email)
+- ✅ Role-based access: Admin vs HR
+- ✅ Async resume processing via RabbitMQ
+- ✅ PII encryption for all candidate data in DB using Fernet
+- ✅ 2 parallel workers for high-throughput screening
+- ✅ Complete observability with Prometheus & Grafana
+- ✅ Docker Compose single-command deployment
 
-## [UI] Showcase
+## 🖥️ UI Showcase
 The platform features a modern, dark-themed recruitment dashboard designed for high-volume screening:
 - **Dashboard:** Overview of active job postings and candidate metrics.
 - **Screening Interface:** Intuitive drag-and-drop resume upload and job profile creation.
