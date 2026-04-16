@@ -110,20 +110,56 @@ export function Results() {
     setIsRefreshing(true);
     try {
       const data = await fetchResults();
-      if (data && data.length > 0) {
-        const all = data.flatMap((batch, bi) =>
-          batch.results.map((r, ri) => apiResultToCandidate(r, bi * 100 + ri))
-        );
-        if (all.length > 0) {
-          setCandidates(all);
-          setDataSource("api");
-        }
+      // Handle both array response and { results: [] } response
+      let resumes: any[] = [];
+      if (Array.isArray(data)) {
+        resumes = data;
+      } else if (data && Array.isArray(data.results)) {
+        resumes = data.results;
+      }
+      
+      if (resumes.length > 0) {
+        const all = resumes.map((r: any, index: number) => ({
+          id: r.id || `api-${index}`,
+          name: r.filename?.replace(/\.[^/.]+$/, "").replace(/[_-]/g, " ") || "Unknown",
+          email: "—",
+          phone: "—",
+          location: "—",
+          experience: 0,
+          education: "—",
+          currentRole: "—",
+          matchScore: r.score || 0,
+          skillsMatched: parseSkills(r.skills_matched),
+          skillsMissing: parseSkills(r.skills_missing),
+          summary: r.match_summary || "",
+          resumeFile: r.filename,
+          appliedFor: r.job_id || "",
+          screened: r.uploaded_at ? new Date(r.uploaded_at).toISOString().split("T")[0] : new Date().toISOString().split("T")[0],
+          status: scoreToStatus(r.score || 0) as "shortlisted" | "reviewing" | "rejected" | "pending",
+          keyHighlights: [],
+        }));
+        setCandidates(all);
+        setDataSource("api");
       }
     } catch {
       // Stay on mock data silently
     } finally {
       setIsRefreshing(false);
     }
+  }
+
+  // Parse skills from JSON string or array
+  function parseSkills(skills: any): string[] {
+    if (!skills) return [];
+    if (Array.isArray(skills)) return skills;
+    if (typeof skills === 'string') {
+      try {
+        return JSON.parse(skills);
+      } catch {
+        return [];
+      }
+    }
+    return [];
   }
 
   const filtered = candidates
