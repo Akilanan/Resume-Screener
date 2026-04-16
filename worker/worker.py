@@ -1,12 +1,18 @@
+"""
+Production AI Worker - No Mock Data Fallback
+Requires valid LLM_API_KEY. Fails gracefully on missing key.
+"""
 import pika
 import json
 import logging
 import time
 import os
+import sys
 import requests
-from llm_scorer import score_resume
+from llm_scorer import score_resume, LLMScoringError, MissingAPIKeyError, health_check
 from pdf_extractor import extract_text_from_pdf
 import psycopg2
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,21 +20,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Log all environment variables at startup
+# Validate environment at startup
 logger.info("=== WORKER STARTING ===")
 logger.info(f"DATABASE_URL: {'set' if os.getenv('DATABASE_URL') else 'NOT SET'}")
-logger.info(f"LLM_API_KEY: {'set' if os.getenv('LLM_API_KEY') else 'NOT SET'}")
+llm_status = health_check()
+logger.info(f"LLM Status: {llm_status['status']} - {llm_status['message']}")
 logger.info(f"RABBITMQ_HOST: {os.getenv('RABBITMQ_HOST', 'rabbitmq')}")
 logger.info("======================")
 
+# Exit if LLM not configured
+if not llm_status['llm_configured']:
+    logger.critical("FATAL: LLM_API_KEY not set. Worker cannot start. Please configure LLM_API_KEY environment variable.")
+    sys.exit(1)
+
 DB_URL = os.getenv("DATABASE_URL")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 
 
 def get_db_connection():
+    """Get database connection with proper pooling"""
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = psycopg2.connect(
+            DB_URL,
+            connect_timeout=10,
+            options="-c statement_timeout=30000"  # 30s timeout
+        )
+        # Enable connection pooling best practices
+        conn.autocommit = False
         logger.info("Database connection successful")
         return conn
     except Exception as e:
@@ -36,19 +54,17 @@ def get_db_connection():
         raise
 
 
-def update_resume_result(resume_id: str, result: dict):
+def update_resume_result(resume_id: str, result: dict, status: str = "completed"):
+    """Update resume with scoring results"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Handle score scaling (convert 0-10 to 0-100 if needed)
         score = result.get("score", 0)
-        if score <= 10:
-            score = score * 10  # Convert to 0-100 scale
         
         cur.execute("""
             UPDATE resumes SET
-                status = 'completed',
+                status = %s,
                 score = %s,
                 match_summary = %s,
                 skills_matched = %s,
@@ -57,6 +73,7 @@ def update_resume_result(resume_id: str, result: dict):
                 processed_at = NOW()
             WHERE id = %s
         """, (
+            status,
             score,
             result.get("summary", ""),
             json.dumps(result.get("skills_matched", [])),
@@ -70,15 +87,41 @@ def update_resume_result(resume_id: str, result: dict):
         logger.info(f"Updated resume {resume_id} with score {score}")
     except Exception as e:
         logger.error(f"Failed to update resume {resume_id}: {e}")
+        # Don't raise - we want to keep the message in queue if DB update fails
         raise
 
 
-def notify_progress(job_id: str, resume_id: str, status: str, score: float = None):
-    """Notify backend about screening progress via HTTP"""
+def mark_resume_failed(resume_id: str, error_message: str):
+    """Mark resume as failed in database"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE resumes SET
+                status = 'failed',
+                match_summary = %s,
+                processed_at = NOW()
+            WHERE id = %s
+        """, (error_message[:500], resume_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to mark resume as failed: {e}")
+
+
+def notify_progress(job_id: str, resume_id: str, status: str, score: float = None, error: str = None):
+    """Notify backend about screening progress"""
     try:
         requests.post(
             f"{BACKEND_URL}/api/v1/screening/progress",
-            json={"job_id": job_id, "resume_id": resume_id, "status": status, "score": score},
+            json={
+                "job_id": job_id, 
+                "resume_id": resume_id, 
+                "status": status, 
+                "score": score,
+                "error": error
+            },
             timeout=5
         )
     except Exception as e:
@@ -86,6 +129,10 @@ def notify_progress(job_id: str, resume_id: str, status: str, score: float = Non
 
 
 def process_message(ch, method, properties, body):
+    """Process resume screening message with proper error handling"""
+    resume_id = None
+    job_id = None
+    
     try:
         logger.info(f"Received message: {body[:200]}...")
         message = json.loads(body)
@@ -104,73 +151,114 @@ def process_message(ch, method, properties, body):
         resume_text = extract_text_from_pdf(file_path)
         logger.info(f"Extracted text length: {len(resume_text)} chars")
         
-        if not resume_text:
-            logger.error("No text extracted from file!")
-            update_resume_result(resume_id, {
-                "score": 0,
-                "summary": "Could not extract text from resume file",
-                "skills_matched": [],
-                "skills_missing": [],
-                "red_flags": ["Text extraction failed"]
-            })
-            notify_progress(job_id, resume_id, "completed", 0)
+        if not resume_text or len(resume_text.strip()) < 50:
+            error_msg = "Could not extract sufficient text from resume file"
+            logger.error(error_msg)
+            mark_resume_failed(resume_id, error_msg)
+            notify_progress(job_id, resume_id, "failed", error=error_msg)
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
-        # Score with LLM
-        result = score_resume(resume_text, job_description)
-        logger.info(f"LLM result: {result}")
+        # Score with LLM - No mock fallback
+        try:
+            result = score_resume(resume_text, job_description)
+            logger.info(f"LLM result: score={result.get('score')}, skills={len(result.get('skills_matched', []))}")
+        except MissingAPIKeyError as e:
+            logger.critical(f"LLM API key missing during processing: {e}")
+            mark_resume_failed(resume_id, f"LLM configuration error: {e}")
+            notify_progress(job_id, resume_id, "failed", error="LLM not configured")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+        except LLMScoringError as e:
+            logger.error(f"LLM scoring failed: {e}")
+            mark_resume_failed(resume_id, f"AI scoring failed: {e}")
+            notify_progress(job_id, resume_id, "failed", error=str(e))
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)  # Requeue for retry
+            return
 
         # Save results to DB
-        score = result.get("score", 0)
-        if score <= 10:
-            score = score * 10
         update_resume_result(resume_id, result)
         
         # Notify: completed with score
-        notify_progress(job_id, resume_id, "completed", score)
+        notify_progress(job_id, resume_id, "completed", score=result.get("score"))
 
         logger.info(f"Completed resume: {resume_id} | Score: {result.get('score')}")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in message: {e}")
+        if resume_id:
+            mark_resume_failed(resume_id, f"Invalid message format: {e}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
     except Exception as e:
         logger.error(f"Failed to process resume: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        try:
-            if 'message' in locals():
-                update_resume_result(message.get("resume_id", "unknown"), {
-                    "score": 0,
-                    "summary": f"Processing failed: {str(e)[:100]}",
-                    "skills_matched": [],
-                    "skills_missing": [],
-                    "red_flags": ["Processing error"]
-                })
-        except:
-            pass
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        if resume_id:
+            try:
+                mark_resume_failed(resume_id, f"Processing failed: {str(e)[:200]}")
+            except:
+                pass
+        # Requeue for retry on unexpected errors
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+
+def setup_rabbitmq():
+    """Setup RabbitMQ with Dead Letter Queue"""
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=os.getenv("RABBITMQ_HOST", "rabbitmq"),
+            connection_attempts=3,
+            retry_delay=2,
+            heartbeat=60
+        )
+    )
+    channel = connection.channel()
+    
+    # Declare dead letter exchange
+    channel.exchange_declare(
+        exchange="resume_dlx",
+        exchange_type="direct",
+        durable=True
+    )
+    
+    # Declare dead letter queue
+    channel.queue_declare(
+        queue="resume_dlq",
+        durable=True,
+        arguments={
+            "x-message-ttl": 86400000  # 24 hours retention
+        }
+    )
+    channel.queue_bind(
+        queue="resume_dlq",
+        exchange="resume_dlx",
+        routing_key="failed"
+    )
+    
+    # Declare main queue with DLQ
+    channel.queue_declare(
+        queue="resume_queue",
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": "resume_dlx",
+            "x-dead-letter-routing-key": "failed"
+        }
+    )
+    
+    channel.basic_qos(prefetch_count=1)
+    return channel
 
 
 def start_worker():
+    """Start the worker with proper error handling"""
     max_retries = 10
     retry_count = 0
     
     while retry_count < max_retries:
         try:
             logger.info(f"Connecting to RabbitMQ (attempt {retry_count + 1})...")
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(
-                    host=os.getenv("RABBITMQ_HOST", "rabbitmq"),
-                    connection_attempts=3,
-                    retry_delay=2
-                )
-            )
-            channel = connection.channel()
-            channel.queue_declare(queue="resume_queue", durable=True)
-            channel.basic_qos(prefetch_count=1)
+            channel = setup_rabbitmq()
             channel.basic_consume(queue="resume_queue", on_message_callback=process_message)
             logger.info("Worker started. Waiting for messages...")
             channel.start_consuming()

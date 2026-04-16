@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.websockets import WebSocket
 from pydantic import BaseModel
@@ -9,9 +9,49 @@ from app.db.database import engine, Base, SessionLocal
 from app.db.models import User, UserRole
 from app.core.security import hash_password
 from app.core.encryption import encrypt
-import asyncio
+from app.core.config import settings
 import json
 import redis
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def create_initial_admin():
+    """Create admin user from environment variables - NOT hardcoded"""
+    db = SessionLocal()
+    try:
+        # Check if admin email is provided via environment
+        admin_email = settings.ADMIN_EMAIL
+        admin_password = settings.ADMIN_PASSWORD
+        
+        if not admin_email or not admin_password:
+            logger.warning("ADMIN_EMAIL or ADMIN_PASSWORD not set. No admin user will be created.")
+            logger.warning("Set ADMIN_EMAIL and ADMIN_PASSWORD environment variables for initial deployment.")
+            return
+        
+        # Check if admin already exists
+        user = db.query(User).filter(User.email == admin_email).first()
+        if user:
+            logger.info(f"Admin user {admin_email} already exists")
+            return
+        
+        # Create admin user
+        admin = User(
+            email=admin_email,
+            name_encrypted=encrypt('Admin User'),
+            hashed_password=hash_password(admin_password),
+            role=UserRole.admin,
+            is_active=True
+        )
+        db.add(admin)
+        db.commit()
+        logger.info(f"Admin user created: {admin_email}")
+        
+    except Exception as e:
+        logger.error(f"Error creating admin: {e}")
+    finally:
+        db.close()
 
 
 @asynccontextmanager
@@ -20,38 +60,31 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     
     # Setup Redis for WebSocket updates
-    from app.core.config import settings
-    app.state.redis = redis.Redis(host=settings.REDIS_HOST, port=6379, decode_responses=True)
+    app.state.redis = redis.Redis(
+        host=settings.REDIS_HOST, 
+        port=6379, 
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
     
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.email == 'admin@talentai.com').first()
-        if not user:
-            admin = User(
-                email='admin@talentai.com',
-                name_encrypted=encrypt('Admin User'),
-                hashed_password=hash_password('Admin@123'),
-                role=UserRole.admin,
-                is_active=True
-            )
-            db.add(admin)
-            db.commit()
-            print("Admin user created: admin@talentai.com / Admin@123")
-        else:
-            print("Admin user already exists")
-    except Exception as e:
-        print(f"Error creating admin: {e}")
-    finally:
-        db.close()
+    # Create admin from environment variables
+    create_initial_admin()
     
     yield
 
 
-app = FastAPI(title="TalentAI API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="TalentAI API", 
+    version="1.0.0", 
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS if hasattr(settings, 'CORS_ORIGINS') else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,21 +100,17 @@ app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
 @app.get("/health")
 @app.get("/api/v1/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 @app.get("/api/v1/health/detailed")
 def detailed_health():
     """Comprehensive health check for all services"""
-    results = {
-        "status": "ok",
-        "services": {}
-    }
+    results = {"status": "ok", "services": {}}
     
     # Check PostgreSQL
     try:
         from sqlalchemy import text
-        from app.db.database import engine
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         results["services"]["postgres"] = {"status": "healthy"}
@@ -91,7 +120,7 @@ def detailed_health():
     
     # Check Redis
     try:
-        r = redis.Redis(host='redis', port=6379)
+        r = redis.Redis(host='redis', port=6379, socket_connect_timeout=3)
         r.ping()
         results["services"]["redis"] = {"status": "healthy"}
     except Exception as e:
@@ -101,7 +130,7 @@ def detailed_health():
     # Check RabbitMQ
     try:
         import pika
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq'))
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', socket_connect_timeout=3))
         connection.close()
         results["services"]["rabbitmq"] = {"status": "healthy"}
     except Exception as e:
@@ -118,12 +147,12 @@ def test_auth():
 
 @app.get("/api/v1/debug/env")
 def debug_env():
-    from app.core.config import settings
     return {
         "llm_key_set": bool(settings.LLM_API_KEY),
         "redis_host": settings.REDIS_HOST,
         "rabbitmq_host": settings.RABBITMQ_HOST,
         "database_url_set": bool(settings.DATABASE_URL),
+        "admin_email_set": bool(settings.ADMIN_EMAIL),
     }
 
 
@@ -131,18 +160,16 @@ def debug_env():
 @app.websocket("/ws/screening/{job_id}")
 async def websocket_screening(websocket: WebSocket, job_id: str):
     await websocket.accept()
+    pubsub = None
     try:
         redis_client = websocket.app.state.redis
         channel = f"screening:{job_id}"
         
-        # Use pubsub for real-time updates
         pubsub = redis_client.pubsub()
         pubsub.subscribe(channel)
         
-        # Send initial connection message
         await websocket.send_json({"status": "connected", "job_id": job_id})
         
-        # Listen for messages in a loop
         while True:
             try:
                 message = pubsub.get_message(timeout=1.0)
@@ -150,21 +177,21 @@ async def websocket_screening(websocket: WebSocket, job_id: str):
                     data = json.loads(message["data"])
                     await websocket.send_json(data)
                     
-                    # Close connection when screening is complete
                     if data.get("status") == "complete":
                         break
             except Exception as e:
-                print(f"WebSocket message error: {e}")
+                logger.error(f"WebSocket message error: {e}")
                 break
-                    
+                
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
     finally:
-        try:
-            pubsub.unsubscribe(channel)
-            pubsub.close()
-        except:
-            pass
+        if pubsub:
+            try:
+                pubsub.unsubscribe(channel)
+                pubsub.close()
+            except:
+                pass
         await websocket.close()
 
 
@@ -174,10 +201,11 @@ class ScreeningProgressRequest(BaseModel):
     resume_id: str
     status: str
     score: float | None = None
+    error: str | None = None
 
 @app.post("/api/v1/screening/progress")
 async def update_screening_progress(request: ScreeningProgressRequest):
-    """Called by worker to update progress - publishes to Redis channel"""
+    """Called by worker to update progress"""
     try:
         redis_client = app.state.redis
         channel = f"screening:{request.job_id}"
@@ -186,9 +214,10 @@ async def update_screening_progress(request: ScreeningProgressRequest):
             "status": request.status,
             "resume_id": request.resume_id,
             "score": request.score,
+            "error": request.error,
         }
         redis_client.publish(channel, json.dumps(data))
         return {"status": "ok"}
     except Exception as e:
-        print(f"Error publishing progress: {e}")
+        logger.error(f"Error publishing progress: {e}")
         return {"status": "error", "message": str(e)}

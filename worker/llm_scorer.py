@@ -1,132 +1,179 @@
+"""
+Production LLM Scorer - No Mock Data
+Requires valid LLM_API_KEY. Fails on missing key.
+"""
 import os
 import json
 import logging
 import hashlib
-import random
-from openai import OpenAI
+from typing import Dict, List, Optional
+from pydantic import BaseModel, Field, ValidationError
+from openai import OpenAI, APIError, RateLimitError, Timeout
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
 
 logger = logging.getLogger(__name__)
 
-SCORE_PROMPT = """You are an expert technical recruiter AI. Analyze the resume against the job description.
-
-JOB DESCRIPTION:
-{job_description}
-
-RESUME:
-{resume_text}
-
-Return ONLY a valid JSON object with this exact structure:
-{{
-  "score": <float 0.0 to 10.0>,
-  "summary": "<2-3 sentence match summary>",
-  "skills_matched": ["skill1", "skill2"],
-  "skills_missing": ["skill1", "skill2"],
-  "red_flags": ["flag1", "flag2"]
-}}"""
-
+# Tech skills for analysis (read-only, no mock generation)
 TECH_SKILLS = [
     "Python", "JavaScript", "TypeScript", "React", "Node.js", "AWS", "Docker", "Kubernetes",
     "Machine Learning", "TensorFlow", "PyTorch", "SQL", "PostgreSQL", "MongoDB", "Redis",
     "GraphQL", "REST API", "Git", "CI/CD", "DevOps", "Linux", "FastAPI", "Flask",
     "Django", "Vue.js", "Angular", "Java", "Spring Boot", "Go", "Rust", "C++",
-    "Data Analysis", "Pandas", "NumPy", "NLP", "Computer Vision", "Docker", "Terraform",
+    "Data Analysis", "Pandas", "NumPy", "NLP", "Computer Vision", "Terraform",
     "Agile", "Scrum", "JIRA", "Figma", "UI/UX Design", "Product Management"
 ]
 
-SOFT_SKILLS = [
-    "Leadership", "Communication", "Problem Solving", "Team Work", "Adaptability",
-    "Time Management", "Critical Thinking", "Creativity"
-]
 
-def generate_mock_score(resume_text: str, job_description: str) -> dict:
-    text_hash = int(hashlib.md5(resume_text.encode()).hexdigest()[:8], 16)
-    random.seed(text_hash)
+class ScoringResponse(BaseModel):
+    """Strict schema for LLM response validation"""
+    score: float = Field(..., ge=0, le=100, description="Match score 0-100")
+    summary: str = Field(..., min_length=10, max_length=500)
+    skills_matched: List[str] = Field(default_factory=list)
+    skills_missing: List[str] = Field(default_factory=list)
+    red_flags: List[str] = Field(default_factory=list)
+
+
+class MissingAPIKeyError(Exception):
+    """Raised when LLM_API_KEY is not configured"""
+    pass
+
+
+class LLMScoringError(Exception):
+    """Raised when LLM scoring fails"""
+    pass
+
+
+def health_check() -> Dict:
+    """Check if LLM is properly configured"""
+    api_key = os.getenv("LLM_API_KEY")
+    if not api_key:
+        return {
+            "status": "error",
+            "llm_configured": False,
+            "message": "LLM_API_KEY environment variable not set"
+        }
+    if len(api_key.strip()) < 10:
+        return {
+            "status": "error", 
+            "llm_configured": False,
+            "message": "LLM_API_KEY appears to be invalid"
+        }
+    return {
+        "status": "healthy",
+        "llm_configured": True,
+        "message": "LLM configured"
+    }
+
+
+def validate_response(response_text: str) -> ScoringResponse:
+    """Validate and parse LLM response against schema"""
+    # Try to extract JSON from response (in case model adds extra text)
+    try:
+        # Find JSON in response
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        if start >= 0 and end > start:
+            json_str = response_text[start:end]
+            data = json.loads(json_str)
+            return ScoringResponse(**data)
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise LLMScoringError(f"Invalid response format: {e}")
     
-    job_lower = job_description.lower()
-    resume_lower = resume_text.lower()
-    matched_skills = []
-    missing_skills = []
+    raise LLMScoringError("No valid JSON found in response")
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_type((RateLimitError, Timeout, requests.exceptions.Timeout)),
+    before_sleep=lambda retry_state: logger.warning(f"LLM call failed, retrying... (attempt {retry_state.attempt_number})")
+)
+def call_llm(client: OpenAI, prompt: str) -> str:
+    """Call LLM with retry logic"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=[
+                {"role": "system", "content": "You are an expert technical recruiter. Always respond with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+            response_format={"type": "json_object"}  # Enforce JSON output
+        )
+        return response.choices[0].message.content
+    except RateLimitError as e:
+        logger.warning(f"Rate limit hit: {e}")
+        raise
+    except Timeout as e:
+        logger.warning(f"LLM timeout: {e}")
+        raise
+    except APIError as e:
+        raise LLMScoringError(f"API error: {e}")
+
+
+def score_resume(resume_text: str, job_description: str) -> Dict:
+    """
+    Score a resume against a job description using LLM.
+    NO MOCK FALLBACK - fails if API key missing.
+    """
+    # Validate API key
+    api_key = os.getenv("LLM_API_KEY")
+    if not api_key:
+        raise MissingAPIKeyError("LLM_API_KEY not configured. Please set the environment variable.")
     
-    # Find matching skills between resume and job
-    for skill in TECH_SKILLS:
-        if skill.lower() in resume_lower and skill.lower() in job_lower:
-            matched_skills.append(skill)
-        elif skill.lower() in job_lower and skill.lower() not in resume_lower:
-            missing_skills.append(skill)
+    client = OpenAI(api_key=api_key)
     
-    # If no matching skills found, generate based on content analysis
-    if not matched_skills:
-        # Extract skills mentioned in job but not in resume
-        job_skills = [s for s in TECH_SKILLS if s.lower() in job_lower]
-        resume_skills = [s for s in TECH_SKILLS if s.lower() in resume_lower]
+    # Build prompt
+    prompt = f"""You are an expert technical recruiter AI. Analyze the resume against the job description.
+
+JOB DESCRIPTION:
+{job_description[:3000]}
+
+RESUME:
+{resume_text[:4000]}
+
+Return ONLY a valid JSON object with this exact structure:
+{{
+  "score": <float 0.0 to 100.0>,
+  "summary": "<2-3 sentence match summary>",
+  "skills_matched": ["skill1", "skill2"],
+  "skills_missing": ["skill1", "skill2"],
+  "red_flags": ["flag1", "flag2"]
+}}
+
+Score guidelines:
+- 90-100: Excellent match, all key skills present
+- 75-89: Good match, most key skills present  
+- 60-74: Partial match, some key skills missing
+- Below 60: Poor match, significant skill gaps
+
+Provide realistic assessments based on actual skill matching."""
+
+    try:
+        response_text = call_llm(client, prompt)
+        result = validate_response(response_text)
         
-        matched_skills = random.sample(resume_skills if resume_skills else TECH_SKILLS, min(random.randint(2, 4), len(resume_skills) if resume_skills else 3))
-        missing_skills = random.sample([s for s in job_skills if s not in matched_skills] if job_skills else [s for s in TECH_SKILLS if s not in matched_skills], random.randint(1, 3))
-    
-    # Calculate score based on match quality
-    num_match = len(matched_skills)
-    num_missing = len(missing_skills)
-    
-    # Base score calculation
-    base_score = 50.0
-    # Add points for matched skills (max 30 points)
-    base_score += min(num_match * 6, 30)
-    # Subtract points for missing skills (max -15 points)
-    base_score -= min(num_missing * 5, 15)
-    # Add variance
-    base_score += random.uniform(-5, 5)
-    
-    # Clamp score between 50 and 98
-    score = max(50.0, min(98.0, base_score))
-    score = round(score, 1)
-    
-    red_flags = []
-    if score < 65:
-        if random.random() < 0.5:
-            red_flags.append("Limited relevant experience")
-    if "gap" in resume_lower or "break" in resume_lower:
-        red_flags.append("Gap in employment history")
-    if "urgent" in job_lower or "asap" in job_lower:
-        red_flags.append("No availability for immediate start")
-    if len(resume_text) < 200:
-        red_flags.append("Resume appears too short")
-    
-    # Generate summary
-    if score >= 85:
-        summary = f"Excellent match with {num_match} highly relevant skills. Strong candidate for this role."
-    elif score >= 75:
-        summary = f"Good match with {num_match} relevant skills. Candidate meets most requirements."
-    elif score >= 65:
-        summary = f"Partial match with {num_match} matching skills. Some gaps in required experience."
-    else:
-        summary = f"Limited match. Candidate has {num_match} relevant skills but missing key requirements."
-    
-    return {
-        "score": score,
-        "summary": summary,
-        "skills_matched": list(set(matched_skills)),
-        "skills_missing": list(set(missing_skills)),
-        "red_flags": red_flags
-    }
-    
-    summary = f"Candidate demonstrates {num_match} relevant technical skills. "
-    if score >= 8:
-        summary += "Strong match for the role with excellent skill alignment."
-    elif score >= 7:
-        summary += "Good match with some relevant experience."
-    else:
-        summary += "Partial match - additional training may be required."
-    
-    return {
-        "score": round(score, 1),
-        "summary": summary,
-        "skills_matched": matched_skills,
-        "skills_missing": missing_skills,
-        "red_flags": red_flags
-    }
+        return {
+            "score": result.score,
+            "summary": result.summary,
+            "skills_matched": result.skills_matched,
+            "skills_missing": result.skills_missing,
+            "red_flags": result.red_flags
+        }
+        
+    except LLMScoringError:
+        raise
+    except Exception as e:
+        raise LLMScoringError(f"Unexpected error during scoring: {e}")
 
-def score_resume(resume_text: str, job_description: str) -> dict:
-    # Always use mock scoring - no API key needed
-    # This ensures consistent, deterministic results for the hackathon
-    logger.warning("Using realistic mock scoring (no LLM_API_KEY)")
-    return generate_mock_score(resume_text, job_description)
+
+def extract_skills_from_text(text: str) -> List[str]:
+    """Extract known skills from text for logging/validation"""
+    text_lower = text.lower()
+    found = []
+    for skill in TECH_SKILLS:
+        if skill.lower() in text_lower:
+            found.append(skill)
+    return found

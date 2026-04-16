@@ -6,6 +6,8 @@ from app.db.models import Resume, Job, ResumeStatus
 from app.core.encryption import encrypt
 from app.queue.producer import publish_resume_job
 from app.core.security import decode_token
+from app.core.file_validation import validate_file, sanitize_filename, is_safe_filename, FileValidationError
+from app.core.s3_storage import upload_to_s3, is_s3_configured, S3StorageError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, ExpiredSignatureError
 import uuid
@@ -30,28 +32,19 @@ class AuthenticationError(HTTPException):
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """
-    Verify JWT token and return user payload
-    Raises:
-        AuthenticationError: If token is invalid or expired
-    """
+    """Verify JWT token and return user payload"""
     token = credentials.credentials
     
-    # Validate token format
     if not token or token in ["null", "undefined", "None"]:
         logger.warning("Invalid token format received")
         raise AuthenticationError("Invalid token format")
     
     try:
         payload = decode_token(token)
-        
-        # Validate required fields
         if "sub" not in payload:
             logger.warning("Token missing 'sub' claim")
             raise AuthenticationError("Invalid token payload: missing subject")
-        
         return payload
-        
     except ExpiredSignatureError:
         logger.warning("Expired token received")
         raise AuthenticationError("Token has expired. Please login again.")
@@ -69,41 +62,99 @@ async def upload_resumes(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """Upload resumes for a job - with file validation and optional S3 storage"""
+    
+    # Check job exists
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
+    
+    # Check S3 availability
+    use_s3 = is_s3_configured()
+    if use_s3:
+        logger.info("S3 storage enabled - files will be stored in cloud")
+    else:
+        logger.info("S3 not configured - using local storage")
+    
     results = []
     for file in files:
-        resume_id = str(uuid.uuid4())
-        save_path = f"/tmp/resumes/{resume_id}.pdf"
-        os.makedirs("/tmp/resumes", exist_ok=True)
-
-        with open(save_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        resume = Resume(
-            id=resume_id,
-            job_id=job_id,
-            filename=file.filename,
-            # PII encrypted before storing
-            candidate_name_encrypted=encrypt("Unknown"),
-            candidate_email_encrypted=encrypt("unknown@unknown.com"),
-            status=ResumeStatus.queued,
-        )
-        db.add(resume)
-        db.commit()
-
-        # Push to queue for async processing
-        publish_resume_job({
-            "resume_id": resume_id,
-            "job_id": job_id,
-            "file_path": save_path,
-            "job_description": job.description,
-        })
-        results.append({"resume_id": resume_id, "filename": file.filename, "status": "queued"})
-
-    return {"uploaded": len(results), "resumes": results}
+        try:
+            # Validate filename
+            if not is_safe_filename(file.filename):
+                raise HTTPException(status_code=400, detail=f"Invalid filename: {file.filename}")
+            
+            # Sanitize filename
+            safe_filename = sanitize_filename(file.filename)
+            
+            # Read file content
+            content = await file.read()
+            
+            # Validate file type and size
+            is_valid, error_msg = validate_file(content, safe_filename)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=error_msg)
+            
+            resume_id = str(uuid.uuid4())
+            
+            # Upload to S3 or local storage
+            if use_s3:
+                try:
+                    s3_uri = upload_to_s3(content, safe_filename)
+                    file_path = s3_uri  # Store S3 URI
+                except S3StorageError as e:
+                    logger.error(f"S3 upload failed: {e}, falling back to local storage")
+                    use_s3 = False
+                    # Continue with local storage
+                else:
+                    # Store S3 URI in database
+                    pass
+            else:
+                # Local storage
+                save_dir = "/tmp/resumes"
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"{resume_id}.pdf")
+                with open(save_path, "wb") as f:
+                    f.write(content)
+                file_path = save_path
+            
+            # Create resume record
+            resume = Resume(
+                id=resume_id,
+                job_id=job_id,
+                filename=safe_filename,
+                candidate_name_encrypted=encrypt("Unknown"),
+                candidate_email_encrypted=encrypt("unknown@unknown.com"),
+                status=ResumeStatus.queued,
+            )
+            db.add(resume)
+            db.commit()
+            
+            # Push to queue for async processing
+            publish_resume_job({
+                "resume_id": resume_id,
+                "job_id": job_id,
+                "file_path": file_path,
+                "job_description": job.description,
+                "use_s3": use_s3,
+            })
+            
+            results.append({
+                "resume_id": resume_id, 
+                "filename": safe_filename, 
+                "status": "queued"
+            })
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to process file {file.filename}: {e}")
+            results.append({
+                "filename": file.filename,
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    return {"uploaded": len([r for r in results if r.get("status") == "queued"]), "resumes": results}
 
 
 @router.get("/results/{job_id}")
@@ -112,6 +163,7 @@ def get_results(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """Get screening results for a job"""
     resumes = db.query(Resume).filter(Resume.job_id == job_id).order_by(Resume.score.desc()).all()
     return [
         {
@@ -135,7 +187,7 @@ async def screen_resumes_direct(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Direct screening endpoint — creates a temp job and queues resumes."""
+    """Direct screening endpoint — creates a temp job and queues resumes"""
     job_id = str(uuid.uuid4())
     from app.db.models import Job as JobModel
     job = JobModel(
@@ -146,34 +198,69 @@ async def screen_resumes_direct(
     )
     db.add(job)
     db.commit()
-
+    
+    use_s3 = is_s3_configured()
     queued = []
+    
     for file in resumes:
-        resume_id = str(uuid.uuid4())
-        save_path = f"/tmp/resumes/{resume_id}.pdf"
-        os.makedirs("/tmp/resumes", exist_ok=True)
-        with open(save_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        resume = Resume(
-            id=resume_id,
-            job_id=job_id,
-            filename=file.filename,
-            candidate_name_encrypted=encrypt("Unknown"),
-            candidate_email_encrypted=encrypt("unknown@unknown.com"),
-            status=ResumeStatus.queued,
-        )
-        db.add(resume)
-        db.commit()
-
-        publish_resume_job({
-            "resume_id": resume_id,
-            "job_id": job_id,
-            "file_path": save_path,
-            "job_description": job_description,
-        })
-        queued.append({"resume_id": resume_id, "filename": file.filename})
-
+        try:
+            # Validate filename
+            if not is_safe_filename(file.filename):
+                continue
+            
+            safe_filename = sanitize_filename(file.filename)
+            content = await file.read()
+            
+            # Validate file
+            is_valid, error_msg = validate_file(content, safe_filename)
+            if not is_valid:
+                continue
+            
+            resume_id = str(uuid.uuid4())
+            
+            # Store file
+            if use_s3:
+                try:
+                    s3_uri = upload_to_s3(content, safe_filename)
+                    file_path = s3_uri
+                except S3StorageError:
+                    use_s3 = False
+                    save_path = f"/tmp/resumes/{resume_id}.pdf"
+                    os.makedirs("/tmp/resumes", exist_ok=True)
+                    with open(save_path, "wb") as f:
+                        f.write(content)
+                    file_path = save_path
+            else:
+                save_path = f"/tmp/resumes/{resume_id}.pdf"
+                os.makedirs("/tmp/resumes", exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(content)
+                file_path = save_path
+            
+            resume = Resume(
+                id=resume_id,
+                job_id=job_id,
+                filename=safe_filename,
+                candidate_name_encrypted=encrypt("Unknown"),
+                candidate_email_encrypted=encrypt("unknown@unknown.com"),
+                status=ResumeStatus.queued,
+            )
+            db.add(resume)
+            db.commit()
+            
+            publish_resume_job({
+                "resume_id": resume_id,
+                "job_id": job_id,
+                "file_path": file_path,
+                "job_description": job_description,
+                "use_s3": use_s3,
+            })
+            
+            queued.append({"resume_id": resume_id, "filename": safe_filename})
+            
+        except Exception as e:
+            logger.error(f"Failed to queue {file.filename}: {e}")
+    
     return {
         "job_id": job_id,
         "total": len(queued),
