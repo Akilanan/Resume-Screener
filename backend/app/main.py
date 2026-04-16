@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.websockets import WebSocket
+from pydantic import BaseModel
 from app.api.v1 import auth, jobs, resumes, admin, analytics
 from app.core.logging import setup_logging
 from app.db.database import engine, Base, SessionLocal
@@ -11,6 +12,7 @@ from app.core.encryption import encrypt
 import asyncio
 import json
 import redis
+import aioredis
 
 
 @asynccontextmanager
@@ -69,6 +71,46 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/v1/health/detailed")
+def detailed_health():
+    """Comprehensive health check for all services"""
+    results = {
+        "status": "ok",
+        "services": {}
+    }
+    
+    # Check PostgreSQL
+    try:
+        from app.db.database import engine
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        results["services"]["postgres"] = {"status": "healthy"}
+    except Exception as e:
+        results["services"]["postgres"] = {"status": "unhealthy", "error": str(e)}
+        results["status"] = "degraded"
+    
+    # Check Redis
+    try:
+        r = redis.Redis(host='redis', port=6379)
+        r.ping()
+        results["services"]["redis"] = {"status": "healthy"}
+    except Exception as e:
+        results["services"]["redis"] = {"status": "unhealthy", "error": str(e)}
+        results["status"] = "degraded"
+    
+    # Check RabbitMQ
+    try:
+        import pika
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq'))
+        connection.close()
+        results["services"]["rabbitmq"] = {"status": "healthy"}
+    except Exception as e:
+        results["services"]["rabbitmq"] = {"status": "unhealthy", "error": str(e)}
+        results["status"] = "degraded"
+    
+    return results
+
+
 @app.get("/api/v1/auth/test")
 def test_auth():
     return {"message": "Backend is running"}
@@ -93,40 +135,60 @@ async def websocket_screening(websocket: WebSocket, job_id: str):
         redis_client = websocket.app.state.redis
         channel = f"screening:{job_id}"
         
-        # Subscribe to the Redis channel for this job
+        # Use pubsub for real-time updates
         pubsub = redis_client.pubsub()
-        await pubsub.subscribe(channel)
+        pubsub.subscribe(channel)
         
         # Send initial connection message
         await websocket.send_json({"status": "connected", "job_id": job_id})
         
-        # Listen for messages and forward to WebSocket
-        for message in pubsub.listen():
-            if message["type"] == "message":
-                data = json.loads(message["data"])
-                await websocket.send_json(data)
-                
-                # Close connection when screening is complete
-                if data.get("status") == "complete":
-                    break
+        # Listen for messages in a loop
+        while True:
+            try:
+                message = pubsub.get_message(timeout=1.0)
+                if message and message["type"] == "message":
+                    data = json.loads(message["data"])
+                    await websocket.send_json(data)
+                    
+                    # Close connection when screening is complete
+                    if data.get("status") == "complete":
+                        break
+            except Exception as e:
+                print(f"WebSocket message error: {e}")
+                break
                     
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
+        try:
+            pubsub.unsubscribe(channel)
+            pubsub.close()
+        except:
+            pass
         await websocket.close()
 
 
 # Endpoint to trigger progress updates (called by worker)
+class ScreeningProgressRequest(BaseModel):
+    job_id: str
+    resume_id: str
+    status: str
+    score: float | None = None
+
 @app.post("/api/v1/screening/progress")
-async def update_screening_progress(job_id: str, resume_id: str, status: str, score: float = None):
+async def update_screening_progress(request: ScreeningProgressRequest):
     """Called by worker to update progress - publishes to Redis channel"""
-    redis_client = app.state.redis
-    channel = f"screening:{job_id}"
-    
-    data = {
-        "status": status,
-        "resume_id": resume_id,
-        "score": score,
-    }
-    await redis_client.publish(channel, json.dumps(data))
-    return {"status": "ok"}
+    try:
+        redis_client = app.state.redis
+        channel = f"screening:{request.job_id}"
+        
+        data = {
+            "status": request.status,
+            "resume_id": request.resume_id,
+            "score": request.score,
+        }
+        redis_client.publish(channel, json.dumps(data))
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"Error publishing progress: {e}")
+        return {"status": "error", "message": str(e)}
