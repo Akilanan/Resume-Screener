@@ -130,7 +130,7 @@ def detailed_health():
     # Check RabbitMQ
     try:
         import pika
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', socket_connect_timeout=3))
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', connection_attempts=3, retry_delay=1))
         connection.close()
         results["services"]["rabbitmq"] = {"status": "healthy"}
     except Exception as e:
