@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   Users,
@@ -13,6 +14,7 @@ import {
   Target,
   BarChart3,
   FileText,
+  Loader2,
 } from "lucide-react";
 import {
   RadialBarChart,
@@ -25,7 +27,7 @@ import {
   Tooltip,
   Cell,
 } from "recharts";
-import { candidates, jobDescriptions, screeningStats } from "../data/mockData";
+import { fetchDashboardStats, BASE_URL } from "../services/api";
 
 const skillData = [
   { skill: "Python", count: 38 },
@@ -67,49 +69,77 @@ const statusIcons: Record<string, React.ReactNode> = {
 
 export function Dashboard() {
   const navigate = useNavigate();
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<any>(null);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const stats = await fetchDashboardStats();
+        setData(stats);
+      } catch (err) {
+        console.error("Dashboard load failed:", err);
+      } finally {
+        setLoading(false);
+      }
+    }
+    load();
+  }, []);
+
+  if (loading || !data) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]">
+        <Loader2 className="animate-spin text-violet-600" size={32} />
+      </div>
+    );
+  }
 
   const stats = [
     {
       label: "Total Screened",
-      value: screeningStats.totalScreened,
+      value: data.stats.total_screened,
       icon: FileText,
       color: "from-violet-500 to-purple-600",
       bg: "bg-violet-50",
       iconColor: "text-violet-600",
-      change: "+12 this week",
+      change: "All time",
       changePositive: true,
     },
     {
       label: "Avg. Match Score",
-      value: `${screeningStats.avgMatchScore}%`,
+      value: `${data.stats.avg_match_score}%`,
       icon: Target,
       color: "from-blue-500 to-cyan-500",
       bg: "bg-blue-50",
       iconColor: "text-blue-600",
-      change: "+3% vs last batch",
+      change: "Global average",
       changePositive: true,
     },
     {
       label: "Shortlisted",
-      value: screeningStats.shortlisted,
+      value: data.stats.shortlisted,
       icon: Users,
       color: "from-emerald-500 to-teal-500",
       bg: "bg-emerald-50",
       iconColor: "text-emerald-600",
-      change: "29% shortlist rate",
+      change: "Score >= 80%",
       changePositive: true,
     },
     {
       label: "Active Jobs",
-      value: screeningStats.activeJobs,
+      value: data.stats.active_jobs,
       icon: Briefcase,
       color: "from-orange-500 to-amber-500",
       bg: "bg-orange-50",
       iconColor: "text-orange-600",
-      change: "1 closing soon",
+      change: "Open positions",
       changePositive: false,
     },
   ];
+
+  const skillData = data.skill_data;
+  const recentActivity = data.recent_activity;
+  const scoreDistribution = data.score_distribution;
 
   return (
     <div className="p-4 lg:p-6 space-y-6">
@@ -272,14 +302,14 @@ export function Dashboard() {
           </h2>
           <div className="flex items-center gap-4">
             <div className="flex-1 space-y-2.5">
-              {scoreDistribution.map((item) => (
+              {scoreDistribution.map((item: any) => (
                 <div key={item.name} className="flex items-center gap-3">
                   <span className="text-xs text-gray-500 w-16 flex-shrink-0">{item.name}</span>
                   <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
                     <div
                       className="h-full rounded-full transition-all"
                       style={{
-                        width: `${(item.value / 63) * 100}%`,
+                        width: data.stats.total_screened > 0 ? `${(item.value / data.stats.total_screened) * 100}%` : '0%',
                         backgroundColor: item.fill,
                       }}
                     />
@@ -291,49 +321,22 @@ export function Dashboard() {
           </div>
         </div>
 
-        {/* Active Job Postings */}
-        <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-4 border-b border-gray-50">
-            <h2 className="text-gray-900 text-sm" style={{ fontWeight: 600 }}>
-              Active Job Postings
-            </h2>
+        {/* Info Banner */}
+        <div className="bg-violet-600 rounded-2xl p-5 text-white relative overflow-hidden">
+          <div className="relative z-10">
+            <h3 className="text-lg mb-2" style={{ fontWeight: 700 }}>Quick Tip</h3>
+            <p className="text-violet-100 text-sm leading-relaxed mb-4">
+              Real-time analytics are refreshed every time you complete a new resume screening batch.
+            </p>
             <button
-              onClick={() => navigate("/jobs")}
-              className="text-xs text-violet-600 hover:text-violet-700 flex items-center gap-1"
-              style={{ fontWeight: 500 }}
+              onClick={() => navigate("/screen")}
+              className="px-4 py-2 bg-white text-violet-600 rounded-lg text-sm transition-colors hover:bg-violet-50"
+              style={{ fontWeight: 600 }}
             >
-              Manage <ChevronRight size={13} />
+              Start Screening
             </button>
           </div>
-          <div className="divide-y divide-gray-50">
-            {jobDescriptions
-              .filter((j) => j.status === "active")
-              .map((job) => (
-                <div
-                  key={job.id}
-                  className="flex items-center gap-3 px-5 py-3.5 hover:bg-gray-50/60 cursor-pointer transition-colors"
-                  onClick={() => navigate("/jobs")}
-                >
-                  <div className="w-9 h-9 rounded-xl bg-violet-50 flex items-center justify-center flex-shrink-0">
-                    <Briefcase size={16} className="text-violet-600" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-gray-800 text-sm truncate" style={{ fontWeight: 500 }}>
-                      {job.title}
-                    </p>
-                    <p className="text-gray-400 text-xs">
-                      {job.department} · {job.location}
-                    </p>
-                  </div>
-                  <div className="text-right flex-shrink-0">
-                    <div className="text-violet-600 text-sm" style={{ fontWeight: 700 }}>
-                      {job.candidatesScreened}
-                    </div>
-                    <div className="text-gray-400 text-xs">screened</div>
-                  </div>
-                </div>
-              ))}
-          </div>
+          <Zap className="absolute -right-4 -bottom-4 text-white/10" size={120} />
         </div>
       </div>
 

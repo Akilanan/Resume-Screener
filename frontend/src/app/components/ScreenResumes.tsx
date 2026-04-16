@@ -150,8 +150,15 @@ export function ScreenResumes() {
       setProgress((p) => (p < 85 ? p + 3 : p));
     }, 200);
 
+    const realFiles = files.map((f) => f.rawFile).filter(Boolean) as File[];
+
+    if (realFiles.length === 0) {
+      setErrorMessage("Please upload at least one real PDF, DOC, or DOCX file. Sample placeholders cannot be analyzed by the AI.");
+      setIsProcessing(false);
+      return;
+    }
+
     try {
-      const realFiles = files.map((f) => f.rawFile).filter(Boolean) as File[];
       const response = await screenResumes(jdText, realFiles);
 
       clearInterval(progressInterval);
@@ -192,14 +199,29 @@ export function ScreenResumes() {
 
   const loadSampleJD = () => setJdText(sampleJD);
 
-  const loadSampleResumes = () => {
-    setFiles([
-      { id: "s-1", name: "priya_sharma_resume.pdf", size: "284 KB", status: "pending" },
-      { id: "s-2", name: "marcus_johnson_resume.pdf", size: "312 KB", status: "pending" },
-      { id: "s-3", name: "aisha_patel_resume.pdf", size: "198 KB", status: "pending" },
-      { id: "s-4", name: "david_chen_resume.pdf", size: "256 KB", status: "pending" },
-      { id: "s-5", name: "sofia_rodriguez_resume.pdf", size: "344 KB", status: "pending" },
-    ]);
+  const loadSampleResumes = async () => {
+    setErrorMessage(null);
+    try {
+      const response = await fetch("/sample_resume.pdf");
+      const blob = await response.blob();
+      
+      const createSampleFile = (name: string) => new File([blob], name, { type: "application/pdf" });
+
+      setFiles([
+        { id: "s-1", name: "priya_sharma_resume.pdf", size: "284 KB", status: "pending", rawFile: createSampleFile("priya_sharma_resume.pdf") },
+        { id: "s-2", name: "marcus_johnson_resume.pdf", size: "312 KB", status: "pending", rawFile: createSampleFile("marcus_johnson_resume.pdf") },
+        { id: "s-3", name: "aisha_patel_resume.pdf", size: "198 KB", status: "pending", rawFile: createSampleFile("aisha_patel_resume.pdf") },
+        { id: "s-4", name: "david_chen_resume.pdf", size: "256 KB", status: "pending", rawFile: createSampleFile("david_chen_resume.pdf") },
+        { id: "s-5", name: "sofia_rodriguez_resume.pdf", size: "344 KB", status: "pending", rawFile: createSampleFile("sofia_rodriguez_resume.pdf") },
+      ]);
+    } catch (err) {
+      console.error("Failed to load sample resumes:", err);
+      // Fallback to placeholders if fetch fails
+      setFiles([
+        { id: "s-1", name: "priya_sharma_resume.pdf", size: "284 KB", status: "pending" },
+        { id: "s-2", name: "marcus_johnson_resume.pdf", size: "312 KB", status: "pending" },
+      ]);
+    }
   };
 
   return (

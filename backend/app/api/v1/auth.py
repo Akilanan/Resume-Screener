@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.db.models import User
-from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token, generate_otp
+from app.core.security import verify_password, create_access_token, create_refresh_token, decode_token, generate_otp, hash_password
 from app.core.config import settings
+from app.core.encryption import encrypt
 from app.schemas.auth import LoginRequest, OTPVerifyRequest, RefreshRequest, TokenResponse
 import redis
 import smtplib
@@ -11,6 +12,26 @@ from email.mime.text import MIMEText
 
 router = APIRouter()
 redis_client = redis.Redis(host=settings.REDIS_HOST, port=6379, decode_responses=True)
+
+
+@router.post("/setup-admin")
+def setup_admin(db: Session = Depends(get_db)):
+    """Create admin user if not exists"""
+    from app.db.models import UserRole
+    user = db.query(User).filter(User.email == 'admin@talentai.com').first()
+    if user:
+        return {"message": "Admin already exists"}
+    
+    admin = User(
+        email='admin@talentai.com',
+        name_encrypted=encrypt('Admin User'),
+        hashed_password=hash_password('Admin@123'),
+        role=UserRole.admin,
+        is_active=True
+    )
+    db.add(admin)
+    db.commit()
+    return {"message": "Admin created successfully", "email": "admin@talentai.com", "password": "Admin@123"}
 
 
 def send_otp_email(to_email: str, otp: str):
@@ -29,20 +50,36 @@ def send_otp_email(to_email: str, otp: str):
         print(f"[MAIL FALLBACK] OTP for {to_email}: {otp}")
 
 
-@router.post("/login")
+@router.post("/login", response_model=TokenResponse)
 def login(request: LoginRequest, db: Session = Depends(get_db)):
+    print(f"Login attempt for: {request.email}")
     user = db.query(User).filter(User.email == request.email).first()
-    if not user or not verify_password(request.password, user.hashed_password):
+    if not user:
+        print("User not found")
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not verify_password(request.password, user.hashed_password):
+        print("Password verification failed")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
     if not user.is_active:
+        print("User account disabled")
         raise HTTPException(status_code=403, detail="Account disabled")
-
-    # Generate and cache OTP in Redis (5 min TTL)
+    
+    # Generate and send OTP
     otp = generate_otp()
     redis_client.setex(f"otp:{request.email}", 300, otp)
     send_otp_email(request.email, otp)
-
-    return {"message": "OTP sent to your email", "mfa_required": True}
+    
+    return {
+        "mfa_required": True,
+        "message": "OTP sent to your email",
+        # Including null tokens to satisfy schema if needed
+        "access_token": None,
+        "refresh_token": None,
+        "token_type": None,
+        "role": None
+    }
 
 
 @router.post("/verify-otp", response_model=TokenResponse)

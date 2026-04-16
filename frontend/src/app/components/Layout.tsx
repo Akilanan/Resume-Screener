@@ -25,6 +25,14 @@ const navItems = [
 export function Layout() {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+    localStorage.removeItem("role");
+    navigate("/login");
+  };
 
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
@@ -96,9 +104,9 @@ export function Layout() {
 
         {/* Bottom actions */}
         <div className="px-3 py-4 border-t border-white/10 space-y-1">
-          <button className="flex items-center gap-3 px-3 py-2.5 w-full rounded-xl text-gray-400 hover:text-white hover:bg-white/8 transition-all">
-            <Settings size={19} className="flex-shrink-0" />
-            {!collapsed && <span className="text-sm">Settings</span>}
+          <button onClick={handleLogout} className="flex items-center gap-3 px-3 py-2.5 w-full rounded-xl text-gray-400 hover:text-white hover:bg-white/8 transition-all">
+            <LogOut size={19} className="flex-shrink-0" />
+            {!collapsed && <span className="text-sm">Logout</span>}
           </button>
 
           {/* User avatar */}

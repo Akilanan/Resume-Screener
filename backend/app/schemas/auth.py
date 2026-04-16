@@ -16,7 +16,9 @@ class RefreshRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_type: str
-    role: str
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str | None = None
+    role: str | None = None
+    mfa_required: bool = False
+    message: str | None = None
