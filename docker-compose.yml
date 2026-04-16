@@ -75,6 +75,7 @@ services:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=DEBUG
       - BACKEND_URL=http://backend:8000
+      - MOCK_MODE=true
     volumes:
       - resumes_data:/tmp/resumes
       - ./worker:/app

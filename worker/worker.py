@@ -28,10 +28,14 @@ logger.info(f"LLM Status: {llm_status['status']} - {llm_status['message']}")
 logger.info(f"RABBITMQ_HOST: {os.getenv('RABBITMQ_HOST', 'rabbitmq')}")
 logger.info("======================")
 
-# Exit if LLM not configured
-if not llm_status['llm_configured']:
+# Exit if LLM not configured AND mock mode is not enabled
+mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
+if not llm_status['llm_configured'] and not mock_mode:
     logger.critical("FATAL: LLM_API_KEY not set. Worker cannot start. Please configure LLM_API_KEY environment variable.")
     sys.exit(1)
+
+if mock_mode:
+    logger.info("Running in MOCK MODE - will use mock scoring for demo")
 
 DB_URL = os.getenv("DATABASE_URL")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
