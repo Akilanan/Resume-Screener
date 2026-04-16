@@ -12,7 +12,6 @@ from app.core.encryption import encrypt
 import asyncio
 import json
 import redis
-import aioredis
 
 
 @asynccontextmanager
@@ -81,9 +80,10 @@ def detailed_health():
     
     # Check PostgreSQL
     try:
+        from sqlalchemy import text
         from app.db.database import engine
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(text("SELECT 1"))
         results["services"]["postgres"] = {"status": "healthy"}
     except Exception as e:
         results["services"]["postgres"] = {"status": "unhealthy", "error": str(e)}
