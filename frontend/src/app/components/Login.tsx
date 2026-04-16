@@ -24,7 +24,12 @@ export function Login() {
       const res = await login(email, password);
       if (res.mfa_required) {
         setShowOtpStep(true);
-        toast.info("Security code sent to your email");
+        // Show OTP in a toast for demo purposes
+        if (res.otp) {
+          toast.success(`Your OTP is: ${res.otp}`);
+        } else {
+          toast.info("Security code sent to your email");
+        }
       } else {
         toast.success("Login successful!");
         navigate("/");

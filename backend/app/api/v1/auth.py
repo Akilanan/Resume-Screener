@@ -66,15 +66,18 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         print("User account disabled")
         raise HTTPException(status_code=403, detail="Account disabled")
     
-    # Generate and send OTP
+    # Generate OTP
     otp = generate_otp()
     redis_client.setex(f"otp:{request.email}", 300, otp)
+    
+    # Try to send email, but also return OTP in response for demo
     send_otp_email(request.email, otp)
     
+    # Return OTP in response for demo purposes (in production, remove this)
     return {
         "mfa_required": True,
         "message": "OTP sent to your email",
-        # Including null tokens to satisfy schema if needed
+        "otp": otp,  # For demo - remove in production!
         "access_token": None,
         "refresh_token": None,
         "token_type": None,
