@@ -82,19 +82,66 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS if hasattr(settings, 'CORS_ORIGINS') else ["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"] if settings.LLM_API_KEY else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    import time
+    import uuid
+    
+    # Add request ID
+    request_id = str(uuid.uuid4())[:8]
+    request.state.request_id = request_id
+    
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        logger.error(f"[{request_id}] Error processing {request.method} {request.url.path}: {str(e)}")
+        raise
+    process_time = time.time() - start_time
+    logger.debug(f"[{request_id}] {request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# Global exception handler
+from fastapi.responses import JSONResponse
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "type": exc.__class__.__name__}
+    )
+
 
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(jobs.router, prefix="/api/v1/jobs", tags=["jobs"])
 app.include_router(resumes.router, prefix="/api/v1/resumes", tags=["resumes"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
+
+
+@app.get("/")
+def root():
+    """Root endpoint - redirect to API documentation"""
+    return {
+        "message": "TalentAI Backend API",
+        "version": "1.0.0",
+        "docs_url": "/docs",
+        "redoc_url": "/redoc",
+        "health_url": "/health",
+        "frontend_url": "http://localhost:5173"
+    }
 
 
 @app.get("/health")

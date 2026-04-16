@@ -73,11 +73,13 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     # Try to send email, but also return OTP in response for demo
     send_otp_email(request.email, otp)
     
-    # Return OTP in response for demo purposes (in production, remove this)
+    # Return OTP in response for DEMO ONLY - REMOVE IN PRODUCTION
+    import os
+    is_demo = os.getenv("DEMO_MODE", "true").lower() == "true"
     return {
         "mfa_required": True,
         "message": "OTP sent to your email",
-        "otp": otp,  # For demo - remove in production!
+        "otp": otp if is_demo else None,  # Hidden in production
         "access_token": None,
         "refresh_token": None,
         "token_type": None,
