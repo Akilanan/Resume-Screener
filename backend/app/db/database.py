@@ -11,15 +11,14 @@ engine = create_engine(
     pool_pre_ping=True,           # Test connections before using
     pool_size=10,                 # Base pool size
     max_overflow=20,              # Additional connections when needed
-    pool_recycle=3600,            # Recycle connections after 1 hour
+    pool_recycle=3600,           # Recycle connections after 1 hour
     pool_timeout=30,             # Wait for connection max 30s
     connect_args={
         "connect_timeout": 10,
-        "statement_timeout": 30000,  # 30s query timeout
     }
 )
 
-# Add event listener for connection errors
+# Add event listener for connection errors and set session timeout
 @event.listens_for(engine, "connect")
 def set_session_timeout(dbapi_conn, connection_record):
     cursor = dbapi_conn.cursor()
