@@ -139,39 +139,55 @@ export function ScreenResumes() {
     setIsDone(true);
   };
 
-  // Real API screening
+  // Real API screening with live progress polling
   const runRealScreening = async () => {
     setIsProcessing(true);
     setProgress(0);
     setErrorMessage(null);
 
-    // Animate progress while waiting
-    const progressInterval = setInterval(() => {
-      setProgress((p) => (p < 85 ? p + 3 : p));
-    }, 200);
+    // Mark all files as processing
+    setFiles((prev) => prev.map((f) => ({ ...f, status: "processing" as const })));
 
     const realFiles = files.map((f) => f.rawFile).filter(Boolean) as File[];
 
     if (realFiles.length === 0) {
       setErrorMessage("Please upload at least one real PDF, DOC, or DOCX file. Sample placeholders cannot be analyzed by the AI.");
       setIsProcessing(false);
+      setFiles((prev) => prev.map((f) => ({ ...f, status: "pending" as const })));
       return;
     }
 
     try {
-      const response = await screenResumes(jdText, realFiles);
+      const response = await screenResumes(
+        jdText,
+        realFiles,
+        // Progress callback — called each time polling detects more completed resumes
+        (completed, total) => {
+          const pct = Math.round((completed / total) * 100);
+          setProgress(pct);
+          // Update individual file statuses as they complete
+          setFiles((prev) => {
+            const updated = [...prev];
+            for (let i = 0; i < Math.min(completed, updated.length); i++) {
+              if (updated[i].status === "processing") {
+                updated[i] = { ...updated[i], status: "done" };
+              }
+            }
+            return updated;
+          });
+        }
+      );
 
-      clearInterval(progressInterval);
       setProgress(100);
 
-      // Map results back to files
+      // Map final results back to files
       const resultMap = new Map(response.results.map((r) => [r.filename, r]));
       setFiles((prev) =>
         prev.map((f) => {
           const result = resultMap.get(f.name);
           return {
             ...f,
-            status: result ? "done" : "error",
+            status: result && result.match_score > 0 ? "done" : "error",
             score: result?.match_score,
           };
         })
@@ -181,9 +197,8 @@ export function ScreenResumes() {
       sessionStorage.setItem("screeningResults", JSON.stringify(response.results));
       setIsDone(true);
     } catch (err: any) {
-      clearInterval(progressInterval);
       setErrorMessage(err.message || "Screening failed. Check your backend connection.");
-      setFiles((prev) => prev.map((f) => ({ ...f, status: "error" })));
+      setFiles((prev) => prev.map((f) => (f.status === "processing" ? { ...f, status: "error" } : f)));
     } finally {
       setIsProcessing(false);
     }

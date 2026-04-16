@@ -119,10 +119,12 @@ export function logout() {
 
 /**
  * Screen resumes against a job description.
+ * Submits to backend, then polls for real AI results until worker finishes.
  */
 export async function screenResumes(
   jobDescription: string,
-  files: File[]
+  files: File[],
+  onProgress?: (completed: number, total: number) => void
 ): Promise<ScreeningResponse> {
   const formData = new FormData();
   formData.append("job_description", jobDescription);
@@ -131,6 +133,7 @@ export async function screenResumes(
   });
 
   try {
+    // Step 1: Submit resumes to backend (queues them for worker processing)
     const response = await fetch(`${BASE_URL}/resumes/screen`, {
       method: "POST",
       headers: getHeaders(),
@@ -147,13 +150,67 @@ export async function screenResumes(
       throw new Error(`Screening failed: ${error}`);
     }
 
-    return response.json();
+    const queueResponse = await response.json();
+    const jobId = queueResponse.job_id;
+    const total = queueResponse.total;
+
+    if (!jobId) {
+      // No job_id means something unexpected — return raw response
+      return queueResponse;
+    }
+
+    // Step 2: Poll for real results until all resumes are processed
+    const maxAttempts = 60; // 60 * 2s = 2 minutes max wait
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds
+
+      const pollResponse = await fetch(`${BASE_URL}/resumes/results/${jobId}`, {
+        headers: getHeaders(),
+      });
+
+      if (!pollResponse.ok) continue;
+
+      const results: any[] = await pollResponse.json();
+      const completed = results.filter(
+        (r: any) => r.status === "completed" || r.status === "failed"
+      ).length;
+
+      if (onProgress) onProgress(completed, total);
+
+      if (completed >= total) {
+        // All done — map to ScreeningResponse format
+        return {
+          job_description: jobDescription,
+          total: results.length,
+          results: results.map((r: any) => ({
+            filename: r.filename,
+            match_score: r.score || 0,
+            matched_skills: parseJsonField(r.skills_matched),
+            missing_skills: parseJsonField(r.skills_missing),
+            summary: r.match_summary || "",
+          })),
+        };
+      }
+    }
+
+    // Timed out — return whatever we have
+    throw new Error("Screening timed out. Results may still be processing. Check the Results page.");
   } catch (err: any) {
     if (err.name === "TypeError" && err.message.includes("fetch")) {
       throw new Error("Cannot connect to backend. Please check if the server is running.");
     }
     throw err;
   }
+}
+
+/** Parse a JSON string field or pass through arrays */
+function parseJsonField(val: any): string[] {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try { return JSON.parse(val); } catch { return []; }
+  }
+  return [];
 }
 
 /**
