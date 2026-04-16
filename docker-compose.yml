@@ -90,6 +90,7 @@ services:
       - talentai_network
 
   frontend:
+    image: hack-frontend:latest
     build: ./frontend
     ports:
       - "5173:5173"
