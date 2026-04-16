@@ -1,22 +1,65 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from app.db.database import get_db
 from app.db.models import Resume, Job, ResumeStatus
 from app.core.encryption import encrypt
 from app.queue.producer import publish_resume_job
 from app.core.security import decode_token
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, ExpiredSignatureError
 import uuid
 import os
 import shutil
+import logging
 from typing import List
 
 router = APIRouter()
 security = HTTPBearer()
+logger = logging.getLogger(__name__)
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    return decode_token(credentials.credentials)
+class AuthenticationError(HTTPException):
+    """Raised when authentication fails"""
+    def __init__(self, detail: str = "Authentication failed"):
+        super().__init__(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=detail,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Verify JWT token and return user payload
+    Raises:
+        AuthenticationError: If token is invalid or expired
+    """
+    token = credentials.credentials
+    
+    # Validate token format
+    if not token or token in ["null", "undefined", "None"]:
+        logger.warning("Invalid token format received")
+        raise AuthenticationError("Invalid token format")
+    
+    try:
+        payload = decode_token(token)
+        
+        # Validate required fields
+        if "sub" not in payload:
+            logger.warning("Token missing 'sub' claim")
+            raise AuthenticationError("Invalid token payload: missing subject")
+        
+        return payload
+        
+    except ExpiredSignatureError:
+        logger.warning("Expired token received")
+        raise AuthenticationError("Token has expired. Please login again.")
+    except JWTError:
+        raise AuthenticationError("Invalid authentication credentials")
+    except Exception as e:
+        logger.error(f"Unexpected auth error: {e}")
+        raise AuthenticationError("Authentication error")
 
 
 @router.post("/upload/{job_id}")
